@@ -37,6 +37,22 @@
 #define MAX_NAT_MAP 131072
 #endif
 
+#ifndef MAX_SERVICE_MAP
+#define MAX_SERVICE_MAP 32768
+#endif
+
+#ifndef MAX_SERVICE_CT_MAP
+#define MAX_SERVICE_CT_MAP 131072
+#endif
+
+#ifndef MAX_SERVICE_BACKEND_MAP
+#define MAX_SERVICE_BACKEND_MAP 131072
+#endif
+
+#ifndef MAX_HUB_REPLY_CT_MAP
+#define MAX_HUB_REPLY_CT_MAP 131072
+#endif
+
 #define FIB_ROUTE_TYPE_CONNECTED 1
 #define FIB_ROUTE_TYPE_ENDPOINT 2
 #define FIB_ROUTE_TYPE_INTERNET_GATEWAY 3
@@ -179,6 +195,102 @@ struct {
   __uint(pinning, LIBBPF_PIN_BY_NAME);
   __array(values, struct fib_inner_map);
 } fib_map SEC(".maps");
+
+struct service_key {
+  __u32 addr;
+  __u16 port;
+  __u8 proto;
+  __u8 pad;
+};
+
+struct service_val {
+  __u16 backend_count;
+  __u16 pad0;
+};
+
+struct service_backend_key {
+  __u32 addr;
+  __u16 port;
+  __u8 proto;
+  __u8 pad0;
+  __u32 slot;
+};
+
+struct service_backend_val {
+  __u32 backend_addr;
+  __u16 backend_port;
+  __u16 pad0;
+};
+
+struct service_inner_map {
+  __uint(type, BPF_MAP_TYPE_HASH);
+  __uint(max_entries, MAX_SERVICE_MAP);
+  __type(key, struct service_key);
+  __type(value, struct service_val);
+};
+
+struct service_inner_map service_inner SEC(".maps");
+
+struct {
+  __uint(type, BPF_MAP_TYPE_HASH_OF_MAPS);
+  __uint(max_entries, MAX_FIB_MAP);
+  __type(key, __u32); // table_id
+  __type(value, __u32);
+  __uint(pinning, LIBBPF_PIN_BY_NAME);
+  __array(values, struct service_inner_map);
+} service_map SEC(".maps");
+
+struct service_backend_inner_map {
+  __uint(type, BPF_MAP_TYPE_HASH);
+  __uint(max_entries, MAX_SERVICE_BACKEND_MAP);
+  __type(key, struct service_backend_key);
+  __type(value, struct service_backend_val);
+};
+
+struct service_backend_inner_map service_backend_inner SEC(".maps");
+
+struct {
+  __uint(type, BPF_MAP_TYPE_HASH_OF_MAPS);
+  __uint(max_entries, MAX_FIB_MAP);
+  __type(key, __u32); // table_id
+  __type(value, __u32);
+  __uint(pinning, LIBBPF_PIN_BY_NAME);
+  __array(values, struct service_backend_inner_map);
+} service_backend_map SEC(".maps");
+
+struct service_ct_key {
+  __u8 proto;
+  __u8 pad0;
+  __u16 pad1;
+  __u32 src_addr;
+  __u16 src_port;
+  __u16 pad2;
+  __u32 dst_addr;
+  __u16 dst_port;
+  __u16 pad3;
+};
+
+struct service_ct_val {
+  __u32 service_addr;
+  __u16 service_port;
+  __u16 pad;
+};
+
+struct {
+  __uint(type, BPF_MAP_TYPE_LRU_HASH);
+  __uint(max_entries, MAX_SERVICE_CT_MAP);
+  __type(key, struct service_ct_key);
+  __type(value, struct service_ct_val);
+  __uint(pinning, LIBBPF_PIN_BY_NAME);
+} service_ct_map SEC(".maps");
+
+struct {
+  __uint(type, BPF_MAP_TYPE_LRU_HASH);
+  __uint(max_entries, MAX_HUB_REPLY_CT_MAP);
+  __type(key, struct service_ct_key);
+  __type(value, __u8);
+  __uint(pinning, LIBBPF_PIN_BY_NAME);
+} hub_reply_ct_map SEC(".maps");
 
 struct bgp_address_pools_key {
   __u32 prefixlen;

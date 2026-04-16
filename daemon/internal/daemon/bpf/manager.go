@@ -42,6 +42,10 @@ type Manager struct {
 	subnetHandler            toolscache.ResourceEventHandlerRegistration
 	rtInformer               cache.Informer
 	rtHandler                toolscache.ResourceEventHandlerRegistration
+	serviceInformer          cache.Informer
+	serviceHandler           toolscache.ResourceEventHandlerRegistration
+	endpointSliceInformer    cache.Informer
+	endpointSliceHandler     toolscache.ResourceEventHandlerRegistration
 
 	nodeName           string
 	vxlanIfindex       int
@@ -54,6 +58,8 @@ type Manager struct {
 
 	podEgressObjs    *PodEgressObjects
 	podEgressLinks   map[int]link.Link
+	podIngressObjs   *PodIngressObjects
+	podIngressLinks  map[int]link.Link
 	bgpAddressPools  map[string]PodEgressBgpAddressPoolsKey
 	hostEgressObjs   *HostEgressObjects
 	hostEgressLink   link.Link
@@ -109,6 +115,15 @@ func (m *Manager) Start(ctx context.Context) error {
 		},
 	}); err != nil {
 		zap.S().Errorf("failed to load pod egress objects: %v", err)
+		return err
+	}
+
+	if err = LoadPodIngressObjects(m.podIngressObjs, &ebpf.CollectionOptions{
+		Maps: ebpf.MapOptions{
+			PinPath: pinPath,
+		},
+	}); err != nil {
+		zap.S().Errorf("failed to load pod ingress objects: %v", err)
 		return err
 	}
 
@@ -235,7 +250,32 @@ func (m *Manager) Start(ctx context.Context) error {
 	}
 	m.rtHandler = rtHandler
 
+	serviceHandler, err := addEventHandler(ctx, m.serviceInformer, m.UpsertService, m.DeleteService)
+	if err != nil {
+		zap.S().Errorf("failed to add event handler for Service: %v", err)
+		return err
+	}
+	m.serviceHandler = serviceHandler
+
+	endpointSliceHandler, err := addEventHandler(ctx, m.endpointSliceInformer, m.UpsertEndpointSlice, m.DeleteEndpointSlice)
+	if err != nil {
+		zap.S().Errorf("failed to add event handler for EndpointSlice: %v", err)
+		return err
+	}
+	m.endpointSliceHandler = endpointSliceHandler
+
 	if err := m.rebuildBGPAddressPools(ctx); err != nil {
+		return err
+	}
+
+	// Let the initial informer replay settle, then converge route/service maps once.
+	time.Sleep(2 * time.Second)
+
+	if err := m.rebuildAllRouteTables(ctx); err != nil {
+		return err
+	}
+
+	if err := m.rebuildAllServiceMaps(ctx); err != nil {
 		return err
 	}
 
@@ -249,13 +289,19 @@ func (m *Manager) Stop() error {
 	for _, l := range m.podEgressLinks {
 		l.Close()
 	}
+	for _, l := range m.podIngressLinks {
+		l.Close()
+	}
 
 	m.podEgressObjs.Close()
+	m.podIngressObjs.Close()
 
 	m.nwepInformer.RemoveEventHandler(m.nwepHandler)
 	m.eipaInformer.RemoveEventHandler(m.eipaHandler)
 	m.addressPoolInformer.RemoveEventHandler(m.addressPoolHandler)
 	m.bgpAdvertisementInformer.RemoveEventHandler(m.bgpAdvertisementHandler)
+	m.serviceInformer.RemoveEventHandler(m.serviceHandler)
+	m.endpointSliceInformer.RemoveEventHandler(m.endpointSliceHandler)
 
 	m.hostEgressLink.Close()
 	m.hostEgressObjs.Close()
@@ -635,7 +681,31 @@ func (m *Manager) UpsertNetworkEndpoint(ctx context.Context, nwep *juneauv1alpha
 		m.mu.Unlock()
 	}
 
-	return m.rebuildAllRouteTables(ctx)
+	ingressLink, err := link.AttachTCX(link.TCXOptions{
+		Program:   m.podIngressObjs.TcPodIngress,
+		Interface: int(nwep.Spec.Ifindex),
+		Attach:    ebpf.AttachTCXEgress,
+	})
+	if err != nil {
+		if errors.Is(err, os.ErrExist) || errors.Is(err, syscall.EEXIST) {
+			zap.S().Debugf("TC pod ingress program already attached to pod interface (ifindex: %d)", nwep.Spec.Ifindex)
+		}
+		if !errors.Is(err, os.ErrExist) && !errors.Is(err, syscall.EEXIST) {
+			zap.S().Errorf("failed to attach TC pod ingress program: %v", err)
+			return err
+		}
+	} else {
+		zap.S().Infof("attached TC pod ingress program to pod interface (ifindex: %d)", nwep.Spec.Ifindex)
+		m.mu.Lock()
+		m.podIngressLinks[nwep.Spec.Ifindex] = ingressLink
+		m.mu.Unlock()
+	}
+
+	if err := m.rebuildAllRouteTables(ctx); err != nil {
+		return err
+	}
+
+	return m.rebuildAllServiceMapsWithNetworkEndpoint(ctx, nwep, false)
 }
 
 func (m *Manager) DeleteNetworkEndpoint(ctx context.Context, nwep *juneauv1alpha1.NetworkEndpoint) error {
@@ -708,9 +778,17 @@ func (m *Manager) DeleteNetworkEndpoint(ctx context.Context, nwep *juneauv1alpha
 		l.Close()
 	}
 	delete(m.podEgressLinks, nwep.Spec.Ifindex)
+	if l, ok := m.podIngressLinks[nwep.Spec.Ifindex]; ok {
+		l.Close()
+	}
+	delete(m.podIngressLinks, nwep.Spec.Ifindex)
 	m.mu.Unlock()
 
-	return m.rebuildAllRouteTables(ctx)
+	if err := m.rebuildAllRouteTables(ctx); err != nil {
+		return err
+	}
+
+	return m.rebuildAllServiceMapsWithNetworkEndpoint(ctx, nwep, true)
 }
 
 func (m *Manager) UpsertRouteTable(ctx context.Context, rt *juneauv1alpha1.RouteTable) error {
@@ -743,9 +821,6 @@ func (m *Manager) UpsertRouteTable(ctx context.Context, rt *juneauv1alpha1.Route
 			if err := m.client.Get(ctx, client.ObjectKey{Name: route.Subnet}, &subnet); err != nil {
 				return err
 			}
-			if subnet.Status.VNI == 1 {
-				continue
-			}
 			val, err = m.buildConnectedFibVal(&subnet)
 			if err != nil {
 				zap.S().Warnf("failed to build connected FIB route for %s: %v", route.Dst, err)
@@ -755,9 +830,6 @@ func (m *Manager) UpsertRouteTable(ctx context.Context, rt *juneauv1alpha1.Route
 			var subnet juneauv1alpha1.Subnet
 			if err := m.client.Get(ctx, client.ObjectKey{Name: route.Subnet}, &subnet); err != nil {
 				return err
-			}
-			if subnet.Status.VNI == 1 {
-				continue
 			}
 			val, err = m.buildEndpointFibVal(ctx, &subnet, &route)
 			if err != nil {
@@ -785,20 +857,32 @@ func (m *Manager) UpsertRouteTable(ctx context.Context, rt *juneauv1alpha1.Route
 		return err
 	}
 
-	return nil
+	return m.rebuildAllServiceMaps(ctx)
 }
 
 func (m *Manager) DeleteRouteTable(ctx context.Context, rt *juneauv1alpha1.RouteTable) error {
 	if err := m.podEgressObjs.FibMap.Delete(uint32(rt.Status.TableID)); err != nil {
 		return err
 	}
-	return nil
+	if err := m.podEgressObjs.ServiceMap.Delete(uint32(rt.Status.TableID)); err != nil && !errors.Is(err, ebpf.ErrKeyNotExist) {
+		return err
+	}
+	if err := m.podEgressObjs.ServiceBackendMap.Delete(uint32(rt.Status.TableID)); err != nil && !errors.Is(err, ebpf.ErrKeyNotExist) {
+		return err
+	}
+	return m.rebuildAllServiceMaps(ctx)
 }
 
 func (m *Manager) buildConnectedFibVal(subnet *juneauv1alpha1.Subnet) (PodEgressFibVal, error) {
-	netmac, err := net.ParseMAC(subnet.Status.GatewayMAC)
-	if err != nil {
-		return PodEgressFibVal{}, err
+	var netmac net.HardwareAddr
+	if subnet.Status.VNI == 1 {
+		netmac = m.hostMac
+	} else {
+		var err error
+		netmac, err = net.ParseMAC(subnet.Status.GatewayMAC)
+		if err != nil {
+			return PodEgressFibVal{}, err
+		}
 	}
 
 	mac, err := HardwareAddrToUint8Array(netmac)
@@ -831,9 +915,14 @@ func (m *Manager) buildEndpointFibVal(ctx context.Context, subnet *juneauv1alpha
 		return PodEgressFibVal{}, err
 	}
 
-	sourceMAC, err := net.ParseMAC(subnet.Status.GatewayMAC)
-	if err != nil {
-		return PodEgressFibVal{}, err
+	var sourceMAC net.HardwareAddr
+	if subnet.Status.VNI == 1 {
+		sourceMAC = m.hostMac
+	} else {
+		sourceMAC, err = net.ParseMAC(subnet.Status.GatewayMAC)
+		if err != nil {
+			return PodEgressFibVal{}, err
+		}
 	}
 
 	smac, err := HardwareAddrToUint8Array(sourceMAC)
@@ -1084,7 +1173,7 @@ func parseBGPAddressPoolPrefix(raw string) (PodEgressBgpAddressPoolsKey, string,
 	return key, ipnet.String(), nil
 }
 
-func NewManager(cl client.Client, nwepInformer cache.Informer, eipaInformer cache.Informer, addressPoolInformer cache.Informer, bgpAdvertisementInformer cache.Informer, rtInformer cache.Informer, subnetInformer cache.Informer, nodeName string, vxlanIfindex int, hostIfindex int, nodeIngressIfindex int, defaultGatewayMac net.HardwareAddr) *Manager {
+func NewManager(cl client.Client, nwepInformer cache.Informer, eipaInformer cache.Informer, addressPoolInformer cache.Informer, bgpAdvertisementInformer cache.Informer, rtInformer cache.Informer, subnetInformer cache.Informer, serviceInformer cache.Informer, endpointSliceInformer cache.Informer, nodeName string, vxlanIfindex int, hostIfindex int, nodeIngressIfindex int, defaultGatewayMac net.HardwareAddr) *Manager {
 	return &Manager{
 		client:                   cl,
 		nwepInformer:             nwepInformer,
@@ -1093,6 +1182,8 @@ func NewManager(cl client.Client, nwepInformer cache.Informer, eipaInformer cach
 		bgpAdvertisementInformer: bgpAdvertisementInformer,
 		rtInformer:               rtInformer,
 		subnetInformer:           subnetInformer,
+		serviceInformer:          serviceInformer,
+		endpointSliceInformer:    endpointSliceInformer,
 		nodeName:                 nodeName,
 		vxlanIfindex:             vxlanIfindex,
 		hostIfindex:              hostIfindex,
@@ -1101,6 +1192,8 @@ func NewManager(cl client.Client, nwepInformer cache.Informer, eipaInformer cach
 		podEgressMapSpecs:        &PodEgressMapSpecs{},
 		podEgressObjs:            &PodEgressObjects{},
 		podEgressLinks:           make(map[int]link.Link),
+		podIngressObjs:           &PodIngressObjects{},
+		podIngressLinks:          make(map[int]link.Link),
 		bgpAddressPools:          make(map[string]PodEgressBgpAddressPoolsKey),
 		hostEgressObjs:           &HostEgressObjects{},
 		vxlanIngressObjs:         &VxlanIngressObjects{},

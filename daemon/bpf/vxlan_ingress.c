@@ -24,7 +24,14 @@ static __always_inline int tc_vxlan_ingress(struct __sk_buff *skb) {
     return TC_ACT_SHOT;
 
   __u32 subnet_id = tkey.tunnel_id & 0xFFFFFF;
-  if (subnet_id == 1) {
+  struct fdb_key fk = {};
+  fk.subnet_id = subnet_id;
+  __builtin_memcpy(fk.mac, eth->h_dest, ETH_ALEN);
+  const struct fdb_val *fv = bpf_map_lookup_elem(&fdb, &fk);
+  if (!fv) {
+    if (subnet_id != 1)
+      return TC_ACT_SHOT;
+
     __u32 host_key = 0;
     const struct host_iface_val *host =
         bpf_map_lookup_elem(&host_iface, &host_key);
@@ -35,13 +42,6 @@ static __always_inline int tc_vxlan_ingress(struct __sk_buff *skb) {
 
     return bpf_redirect(host->ifindex, 0);
   }
-
-  struct fdb_key fk = {};
-  fk.subnet_id = subnet_id;
-  __builtin_memcpy(fk.mac, eth->h_dest, ETH_ALEN);
-  const struct fdb_val *fv = bpf_map_lookup_elem(&fdb, &fk);
-  if (!fv)
-    return TC_ACT_SHOT;
 
   if (fv->ifindex != 0)
     return bpf_redirect(fv->ifindex, 0);

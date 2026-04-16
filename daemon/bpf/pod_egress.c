@@ -68,6 +68,243 @@ static __always_inline int update_l4_csum(struct __sk_buff *skb,
   return TC_ACT_OK;
 }
 
+static __always_inline int load_l4_info(struct __sk_buff *skb,
+                                        const struct iphdr *iph,
+                                        __u16 *src_port, __u16 *dst_port,
+                                        __u32 *l4_off, __u32 *check_off,
+                                        bool *skip_csum) {
+  __u32 ihl = iph->ihl;
+  if (ihl < 5)
+    return TC_ACT_SHOT;
+
+  if ((bpf_ntohs(iph->frag_off) & IP_OFFSET) != 0)
+    return TC_ACT_OK;
+
+  *l4_off = sizeof(struct ethhdr) + ihl * 4;
+  *skip_csum = false;
+
+  if (iph->protocol == IPPROTO_TCP) {
+    struct {
+      __be16 source;
+      __be16 dest;
+    } ports;
+    if (bpf_skb_load_bytes(skb, *l4_off, &ports, sizeof(ports)) < 0)
+      return TC_ACT_SHOT;
+
+    *src_port = bpf_ntohs(ports.source);
+    *dst_port = bpf_ntohs(ports.dest);
+    *check_off = *l4_off + __builtin_offsetof(struct tcphdr, check);
+    return TC_ACT_OK;
+  }
+
+  if (iph->protocol == IPPROTO_UDP) {
+    struct udphdr udp = {};
+    if (bpf_skb_load_bytes(skb, *l4_off, &udp, sizeof(udp)) < 0)
+      return TC_ACT_SHOT;
+
+    *src_port = bpf_ntohs(udp.source);
+    *dst_port = bpf_ntohs(udp.dest);
+    *check_off = *l4_off + __builtin_offsetof(struct udphdr, check);
+    *skip_csum = udp.check == 0;
+    return TC_ACT_OK;
+  }
+
+  return TC_ACT_OK;
+}
+
+static __always_inline int rewrite_service_nat(struct __sk_buff *skb,
+                                               __u32 l4_off,
+                                               bool rewrite_src,
+                                               __u32 check_off,
+                                               bool skip_l4_csum,
+                                               __u32 old_addr_host,
+                                               __u32 new_addr_host,
+                                               __u16 old_port_host,
+                                               __u16 new_port_host) {
+  if (old_addr_host != new_addr_host) {
+    __be32 old_addr = bpf_htonl(old_addr_host);
+    __be32 new_addr = bpf_htonl(new_addr_host);
+
+    if (bpf_l3_csum_replace(skb,
+                            sizeof(struct ethhdr) +
+                                __builtin_offsetof(struct iphdr, check),
+                            old_addr, new_addr, sizeof(new_addr)) < 0)
+      return TC_ACT_SHOT;
+
+    if (!skip_l4_csum &&
+        bpf_l4_csum_replace(skb, check_off, old_addr, new_addr,
+                            BPF_F_PSEUDO_HDR | sizeof(new_addr)) < 0)
+      return TC_ACT_SHOT;
+  }
+
+  if (old_port_host != new_port_host && !skip_l4_csum &&
+      bpf_l4_csum_replace(skb, check_off, bpf_htons(old_port_host),
+                          bpf_htons(new_port_host), sizeof(__be16)) < 0)
+    return TC_ACT_SHOT;
+
+  if (old_addr_host != new_addr_host) {
+    __be32 new_addr = bpf_htonl(new_addr_host);
+    __u32 addr_off = sizeof(struct ethhdr) +
+                     __builtin_offsetof(struct iphdr, daddr);
+    if (rewrite_src)
+      addr_off = sizeof(struct ethhdr) +
+                 __builtin_offsetof(struct iphdr, saddr);
+
+    if (bpf_skb_store_bytes(skb, addr_off, &new_addr, sizeof(new_addr), 0) < 0)
+      return TC_ACT_SHOT;
+  }
+
+  if (old_port_host != new_port_host) {
+    __be16 new_port = bpf_htons(new_port_host);
+    __u32 port_off = l4_off + sizeof(__be16);
+    if (rewrite_src)
+      port_off = l4_off;
+
+    if (bpf_skb_store_bytes(skb, port_off, &new_port, sizeof(new_port), 0) < 0)
+      return TC_ACT_SHOT;
+  }
+
+  return TC_ACT_OK;
+}
+
+static __always_inline int forward_l2(struct __sk_buff *skb, struct ethhdr *eth,
+                                      __u32 subnet_id);
+
+static __always_inline __u32 service_flow_hash(struct __sk_buff *skb,
+                                               const struct iphdr *iph,
+                                               __u16 src_port,
+                                               __u16 dst_port) {
+  __u32 hash = bpf_get_hash_recalc(skb);
+  if (hash != 0)
+    return hash;
+
+  hash = bpf_ntohl(iph->saddr);
+  hash ^= bpf_ntohl(iph->daddr) + 0x9e3779b9 + (hash << 6) + (hash >> 2);
+  hash ^= ((__u32)src_port << 16) | dst_port;
+  hash ^= ((__u32)iph->protocol << 24);
+  hash ^= hash >> 16;
+  hash *= 0x7feb352d;
+  hash ^= hash >> 15;
+
+  return hash;
+}
+
+static __always_inline int maybe_service_dnat(struct __sk_buff *skb,
+                                              const struct subnet_val *subnet) {
+  struct iphdr iph = {};
+  if (bpf_skb_load_bytes(skb, sizeof(struct ethhdr), &iph, sizeof(iph)) < 0)
+    return TC_ACT_SHOT;
+
+  if (iph.protocol != IPPROTO_TCP && iph.protocol != IPPROTO_UDP)
+    return TC_ACT_OK;
+
+  __u16 src_port = 0;
+  __u16 dst_port = 0;
+  __u32 l4_off = 0;
+  __u32 check_off = 0;
+  bool skip_l4_csum = false;
+  int l4_ret = load_l4_info(skb, &iph, &src_port, &dst_port, &l4_off,
+                            &check_off, &skip_l4_csum);
+  if (l4_ret != TC_ACT_OK)
+    return l4_ret;
+
+  __u32 tid = subnet->table_id;
+  void *service_inner_map = bpf_map_lookup_elem(&service_map, &tid);
+  if (!service_inner_map)
+    return TC_ACT_OK;
+
+  struct service_key service_key = {
+      .addr = bpf_ntohl(iph.daddr),
+      .port = dst_port,
+      .proto = iph.protocol,
+  };
+  const struct service_val *service_meta =
+      bpf_map_lookup_elem(service_inner_map, &service_key);
+  if (!service_meta || service_meta->backend_count == 0)
+    return TC_ACT_OK;
+
+  void *service_backend_inner_map =
+      bpf_map_lookup_elem(&service_backend_map, &tid);
+  if (!service_backend_inner_map)
+    return TC_ACT_SHOT;
+
+  __u32 flow_hash = service_flow_hash(skb, &iph, src_port, dst_port);
+  struct service_backend_key backend_key = {
+      .addr = service_key.addr,
+      .port = service_key.port,
+      .proto = service_key.proto,
+      .slot = flow_hash % service_meta->backend_count,
+  };
+  const struct service_backend_val *backend =
+      bpf_map_lookup_elem(service_backend_inner_map, &backend_key);
+  if (!backend)
+    return TC_ACT_SHOT;
+
+  struct service_ct_key ct_key = {
+      .proto = iph.protocol,
+      .src_addr = backend->backend_addr,
+      .src_port = backend->backend_port,
+      .dst_addr = bpf_ntohl(iph.saddr),
+      .dst_port = src_port,
+  };
+  struct service_ct_val ct_val = {
+      .service_addr = service_key.addr,
+      .service_port = service_key.port,
+  };
+  if (bpf_map_update_elem(&service_ct_map, &ct_key, &ct_val, BPF_ANY) < 0)
+    return TC_ACT_SHOT;
+
+  return rewrite_service_nat(skb, l4_off, false, check_off, skip_l4_csum,
+                             service_key.addr, backend->backend_addr,
+                             service_key.port, backend->backend_port);
+}
+
+static __always_inline int maybe_forward_hub_reply(struct __sk_buff *skb,
+                                                   struct ethhdr *eth,
+                                                   struct iphdr *iph) {
+  struct subnet_key default_key = {
+      .subnet_id = 1,
+  };
+  const struct subnet_val *default_subnet =
+      bpf_map_lookup_elem(&subnet_map, &default_key);
+  if (!default_subnet)
+    return TC_ACT_SHOT;
+
+  __u16 src_port = 0;
+  __u16 dst_port = 0;
+  __u32 l4_off = 0;
+  __u32 check_off = 0;
+  bool skip_l4_csum = false;
+  int l4_ret = load_l4_info(skb, iph, &src_port, &dst_port, &l4_off,
+                            &check_off, &skip_l4_csum);
+  if (l4_ret != TC_ACT_OK)
+    return l4_ret;
+
+  struct service_ct_key reply_key = {
+      .proto = iph->protocol,
+      .src_addr = bpf_ntohl(iph->saddr),
+      .src_port = src_port,
+      .dst_addr = bpf_ntohl(iph->daddr),
+      .dst_port = dst_port,
+  };
+  const __u8 *allow = bpf_map_lookup_elem(&hub_reply_ct_map, &reply_key);
+  if (!allow)
+    return TC_ACT_SHOT;
+
+  struct arp_table_key ak = {
+      .subnet_id = 1,
+      .ipaddr = reply_key.dst_addr,
+  };
+  const struct arp_table_val *av = bpf_map_lookup_elem(&arp_table, &ak);
+  if (!av)
+    return TC_ACT_SHOT;
+
+  __builtin_memcpy(eth->h_dest, av->mac, ETH_ALEN);
+  __builtin_memcpy(eth->h_source, default_subnet->gw_mac, ETH_ALEN);
+
+  return forward_l2(skb, eth, 1);
+}
+
 static __always_inline int handle_snat(struct __sk_buff *skb,
                                        struct ethhdr *eth, struct iphdr *iph,
                                        const struct fib_val *fv) {
@@ -256,6 +493,19 @@ static __always_inline int handle_l3(struct __sk_buff *skb, struct ethhdr *eth,
   if ((void *)(iph + 1) > data_end)
     return TC_ACT_SHOT;
 
+  int service_ret = maybe_service_dnat(skb, subnet);
+  if (service_ret != TC_ACT_OK)
+    return service_ret;
+
+  void *data = (void *)(long)skb->data;
+  data_end = (void *)(long)skb->data_end;
+  eth = data;
+  if ((void *)(eth + 1) > data_end)
+    return TC_ACT_SHOT;
+  iph = (void *)(eth + 1);
+  if ((void *)(iph + 1) > data_end)
+    return TC_ACT_SHOT;
+
   __u32 dst_be = iph->daddr; // keep network order for LPM trie
 
   __u32 tid = subnet->table_id;
@@ -269,7 +519,7 @@ static __always_inline int handle_l3(struct __sk_buff *skb, struct ethhdr *eth,
   };
   const struct fib_val *fv = bpf_map_lookup_elem(fib_inner_map, &fkey);
   if (!fv)
-    return TC_ACT_SHOT;
+    return maybe_forward_hub_reply(skb, eth, iph);
 
   if (fv->type == FIB_ROUTE_TYPE_CONNECTED) {
     struct arp_table_key ak = {
@@ -326,16 +576,6 @@ static __always_inline int handle_l2(struct __sk_buff *skb) {
   if (h_proto == ETH_P_ARP)
     return handle_arp(skb, data_end, eth, val->subnet_id, subnet);
 
-  if (val->subnet_id == 1) {
-    __u32 host_key = 0;
-    const struct host_iface_val *host =
-        bpf_map_lookup_elem(&host_iface, &host_key);
-    if (!host)
-      return TC_ACT_SHOT;
-    return bpf_redirect(host->ifindex, 0);
-  }
-
-  // subnet_id != 1
   bool is_gw = true;
 #pragma unroll
   for (int i = 0; i < ETH_ALEN; i++) {
@@ -344,6 +584,22 @@ static __always_inline int handle_l2(struct __sk_buff *skb) {
       break;
     }
   }
+
+  if (val->subnet_id == 1) {
+    if (is_gw) {
+      int l3_ret = handle_l3(skb, eth, subnet);
+      if (l3_ret != TC_ACT_SHOT)
+        return l3_ret;
+    }
+
+    __u32 host_key = 0;
+    const struct host_iface_val *host =
+        bpf_map_lookup_elem(&host_iface, &host_key);
+    if (!host)
+      return TC_ACT_SHOT;
+    return bpf_redirect(host->ifindex, 0);
+  }
+
   if (is_gw)
     return handle_l3(skb, eth, subnet);
 
